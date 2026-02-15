@@ -1,4 +1,5 @@
 import aiosqlite
+import re
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, F
@@ -65,6 +66,7 @@ def user_manage_kb(user_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🧾 Изменить тариф", callback_data=f"admin_tariff:{user_id}"),
+            InlineKeyboardButton(text="📅 Изменить период", callback_data=f"admin_period:{user_id}"),
         ],
         [
             InlineKeyboardButton(text="➕ Ключ OutLine", callback_data=f"admin_key:{user_id}:outline"),
@@ -119,6 +121,10 @@ def _tariff_title(code: str | None) -> str:
 
 class AdminKeyStates(StatesGroup):
     waiting_key = State()
+
+
+class AdminPeriodStates(StatesGroup):
+    waiting_period = State()
 
 
 async def _stats():
@@ -310,6 +316,57 @@ async def _add_months(user_id: int, months: int) -> int:
     days = months * 30
     await _add_days(user_id, days)
     return days
+
+
+def _parse_period_input(raw_text: str) -> tuple[datetime, datetime] | None:
+    match = re.fullmatch(
+        r"\s*от\s+(\d{2}\.\d{2}\.\d{4})\s+до\s+(\d{2}\.\d{2}\.\d{4})\s*",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    try:
+        date_from = datetime.strptime(match.group(1), "%d.%m.%Y").date()
+        date_to = datetime.strptime(match.group(2), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+    if date_to < date_from:
+        return None
+
+    start_dt = datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+    end_dt = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59, tzinfo=timezone.utc)
+    return start_dt, end_dt
+
+
+async def _set_period_range(user_id: int, start_dt: datetime, end_dt: datetime) -> int:
+    if _DB_PATH is None:
+        raise RuntimeError("admin not setup")
+
+    period_days = (end_dt.date() - start_dt.date()).days + 1
+
+    async with aiosqlite.connect(_DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO subscriptions(telegram_id, purchased_at, period_days, expires_at, tariff, warn_2d_sent, expired_sent, keys_deleted)
+            VALUES (?, ?, ?, ?, NULL, 0, 0, 0)
+            ON CONFLICT(telegram_id) DO NOTHING
+        """, (user_id, start_dt.isoformat(), period_days, end_dt.isoformat()))
+
+        await db.execute("""
+            UPDATE subscriptions
+            SET purchased_at=?,
+                period_days=?,
+                expires_at=?,
+                warn_2d_sent=0,
+                expired_sent=0,
+                keys_deleted=0
+            WHERE telegram_id=?
+        """, (start_dt.isoformat(), period_days, end_dt.isoformat(), user_id))
+        await db.commit()
+
+    return period_days
 
 
 async def _apply_latest_pending_payment_tariff(user_id: int) -> str | None:
@@ -540,6 +597,38 @@ async def admin_set_tariff(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admin_period:"))
+async def admin_period_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        user_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    row = await _get_user(user_id)
+    if not row:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+
+    uid, first, last, *_ = row
+    full_name = (f"{first or ''} {last or ''}").strip() or "Без имени"
+
+    await state.set_state(AdminPeriodStates.waiting_period)
+    await state.update_data(target_user_id=user_id)
+
+    await callback.message.answer(
+        f"📅 Введите новый период для пользователя <b>{full_name}</b> (ID: <code>{uid}</code>)\n\n"
+        "Формат: <code>от 11.02.2026 до 14.03.2026</code>",
+        reply_markup=cancel_kb(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("admin_add:"))
 async def admin_add(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -676,3 +765,48 @@ async def admin_key_receive(message: Message, state: FSMContext):
         pass
 
     await message.answer(f"✅ Ключ <b>{key_name}</b> сохранён и пользователь уведомлён.", parse_mode=ParseMode.HTML)
+
+
+@router.message(AdminPeriodStates.waiting_period)
+async def admin_period_receive(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет доступа.")
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    user_id = int(data.get("target_user_id", 0))
+
+    parsed = _parse_period_input((message.text or "").strip())
+    if not parsed:
+        await message.answer(
+            "Неверный формат. Отправьте так:\n"
+            "<code>от 11.02.2026 до 14.03.2026</code>\n"
+            "Дата окончания должна быть не раньше даты начала.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    start_dt, end_dt = parsed
+    period_days = await _set_period_range(user_id, start_dt, end_dt)
+    await state.clear()
+
+    start_human = start_dt.strftime("%d.%m.%Y")
+    end_human = end_dt.strftime("%d.%m.%Y")
+
+    try:
+        await message.bot.send_message(
+            user_id,
+            "📅 <b>Изменение периода подписки</b>\n\n"
+            f"Администратор изменил ваш период на: <b>от {start_human} до {end_human}</b>.\n"
+            f"Длительность: <b>{period_days} дней</b>.",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+    await message.answer(
+        f"✅ Период обновлён: <b>от {start_human} до {end_human}</b> ({period_days} дней).",
+        reply_markup=user_manage_kb(user_id),
+        parse_mode=ParseMode.HTML
+    )
